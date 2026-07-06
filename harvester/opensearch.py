@@ -10,6 +10,8 @@ from botocore.credentials import Credentials
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection, helpers
 from opensearchpy.exceptions import ConnectionTimeout
 
+from harvester.opensearch_transform import DcatIndexTransformer, concept_labels
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +31,23 @@ class OpenSearchInterface:
     STOP_FILTER = "datagov_stop"
     KEYWORD_NORMALIZER = "lowercase_normalizer"
     DEFAULT_CATALOG_BASE_URL = "https://catalog.data.gov"
+    DCAT_TEXT_COMPATIBLE_FIELDS = {
+        "accrualPeriodicity",
+        "accessRights",
+        "conformsTo",
+        "identifier",
+        "landingPage",
+        "license",
+        "rights",
+        "status",
+        "temporal",
+        "theme",
+    }
+
+    # Produces the canonical DCAT-US 3.0-shaped search fields (identifier,
+    # theme, publisher, ...) from a dataset's DCAT metadata, mapping DCAT-US 1.1
+    # values up into the DCAT-US 3.0 structure. See harvester/opensearch_transform.py.
+    DCAT_INDEX_TRANSFORMER = DcatIndexTransformer()
 
     SETTINGS = {
         "analysis": {
@@ -100,15 +119,85 @@ class OpenSearchInterface:
                     },
                 },
             },
+            # theme is stored as a list of DCAT-US 3.0 Concept objects. DCAT-US
+            # 1.1 string themes are mapped up to {"prefLabel": <string>} before
+            # indexing, so the shape is uniform. prefLabel is full-text
+            # searchable with an exact-match keyword sub-field for faceting.
             "theme": {
-                "type": "text",
-                "analyzer": TEXT_ANALYZER,
-                "search_analyzer": TEXT_ANALYZER,
+                "type": "object",
+                "properties": {
+                    "@id": {"type": "keyword"},
+                    "prefLabel": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword",
+                                "normalizer": KEYWORD_NORMALIZER,
+                            }
+                        },
+                    },
+                    "altLabel": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                    },
+                    "definition": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                    },
+                    "notation": {"type": "keyword"},
+                },
             },
+            # identifier is stored as a DCAT-US 3.0 Identifier object. DCAT-US
+            # 1.1 string identifiers are mapped up to {"@id": <string>} before
+            # indexing. @id is full-text searchable with an exact-match keyword
+            # sub-field so it can be searched as free text or matched exactly.
             "identifier": {
-                "type": "text",
-                "analyzer": TEXT_ANALYZER,
-                "search_analyzer": TEXT_ANALYZER,
+                "type": "object",
+                "properties": {
+                    "@id": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "notation": {"type": "keyword"},
+                    "schemaAgency": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                    },
+                    "version": {"type": "keyword"},
+                },
+            },
+            # inSeries is stored as a list of DCAT-US 3.0 DatasetSeries objects.
+            # DCAT-US 1.1 isPartOf strings are mapped up to {"@id": <string>}
+            # before indexing, so the shape is uniform. title is full-text
+            # searchable with an exact-match keyword sub-field for faceting.
+            "inSeries": {
+                "type": "object",
+                "properties": {
+                    "@id": {"type": "keyword"},
+                    "title": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword",
+                                "normalizer": KEYWORD_NORMALIZER,
+                            }
+                        },
+                    },
+                    "description": {
+                        "type": "text",
+                        "analyzer": TEXT_ANALYZER,
+                        "search_analyzer": TEXT_ANALYZER,
+                    },
+                },
             },
             "has_spatial": {"type": "boolean"},
             "popularity": {"type": "integer"},
@@ -237,6 +326,53 @@ class OpenSearchInterface:
             return json.dumps(value, sort_keys=True)
         return str(value)
 
+    @staticmethod
+    def _normalize_dataset_identifier(identifier: Any) -> str | None:
+        if identifier is None:
+            return None
+        if isinstance(identifier, str):
+            return identifier if identifier.strip() else None
+        if isinstance(identifier, dict):
+            value = identifier.get("@id")
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
+    @classmethod
+    def _dcat_text_from_object(cls, value: dict, field: str) -> str:
+        if field == "identifier":
+            identifier = cls._normalize_dataset_identifier(value)
+            if identifier:
+                return identifier
+
+        preferred_keys = (
+            ("prefLabel", "title", "name", "label", "notation", "@id")
+            if field in {"accessRights", "status", "theme"}
+            else ("@id", "title", "name", "prefLabel", "label", "notation")
+        )
+        for key in preferred_keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+            if isinstance(candidate, list):
+                text_values = [
+                    str(item) for item in candidate if item is not None and str(item)
+                ]
+                if text_values:
+                    return ", ".join(text_values)
+
+        return cls._serialize_dcat_value(value)
+
+    @classmethod
+    def _normalize_dcat_text_value(cls, value: Any, field: str) -> Any:
+        if isinstance(value, dict):
+            return cls._dcat_text_from_object(value, field)
+        if isinstance(value, list):
+            return [cls._normalize_dcat_text_value(item, field) for item in value]
+        if value is None or isinstance(value, str):
+            return value
+        return str(value)
+
     @classmethod
     def _normalize_dcat_metadata_value(cls, value: Any) -> Any:
         # stringify nested objects/lists because
@@ -276,13 +412,20 @@ class OpenSearchInterface:
                 if isinstance(value, (datetime, date)):
                     normalized_dcat[field] = value.isoformat()
                 elif value is not None and not isinstance(value, str):
-                    normalized_dcat[field] = str(value)
+                    normalized_dcat[field] = (
+                        cls._normalize_dcat_text_value(value, field)
+                        if field == "temporal"
+                        else str(value)
+                    )
         spatial = normalized_dcat.get("spatial")
         if spatial is not None and not isinstance(spatial, str):
             normalized_dcat["spatial"] = cls._serialize_dcat_value(spatial)
 
         for field, value in normalized_dcat.items():
             if field in date_fields or field in {"publisher", "spatial"}:
+                continue
+            if field in cls.DCAT_TEXT_COMPATIBLE_FIELDS:
+                normalized_dcat[field] = cls._normalize_dcat_text_value(value, field)
                 continue
             normalized_dcat[field] = cls._normalize_dcat_metadata_value(value)
         return normalized_dcat
@@ -339,14 +482,19 @@ class OpenSearchInterface:
         return {"lat": lat_total / count, "lon": lon_total / count}
 
     def dataset_to_document(self, dataset):
-        """Map a dataset into a document for indexing."""
+        """Map a dataset into a document for indexing.
+
+        DCAT-derived search fields are produced by ``DCAT_INDEX_TRANSFORMER``,
+        which maps DCAT-US 1.1 values up into the canonical DCAT-US 3.0 shape so
+        that each OpenSearch field has a single, stable data type. The full
+        ``dcat`` blob is still stored (flattened to text) for reference.
+        """
+        indexed = self.DCAT_INDEX_TRANSFORMER.transform(dataset.dcat)
+
         spatial_value = dataset.dcat.get("spatial")
-        themes = dataset.dcat.get("theme") or []
-        if isinstance(themes, str):
-            themes = [themes]
         has_spatial_theme = any(
-            isinstance(theme, str) and theme.strip().lower() == "geospatial"
-            for theme in themes
+            label.strip().lower() == "geospatial"
+            for label in concept_labels(indexed["theme"])
         )
         has_spatial = (
             bool(spatial_value and str(spatial_value).strip())
@@ -367,22 +515,19 @@ class OpenSearchInterface:
         document = {
             "_index": self.INDEX_NAME,
             "_id": dataset.id,
-            "title": dataset.dcat.get("title", ""),
+            "title": indexed["title"],
             "slug": dataset.slug,
             "last_harvested_date": last_harvested,
-            "description": dataset.dcat.get("description", ""),
-            "publisher": dataset.dcat.get("publisher", {}).get("name", ""),
+            "description": indexed["description"],
+            "publisher": indexed["publisher"],
             "dcat": normalized_dcat,
-            "keyword": dataset.dcat.get("keyword", []),
-            "theme": dataset.dcat.get("theme", []),
-            "identifier": dataset.dcat.get("identifier", ""),
+            "keyword": indexed["keyword"],
+            "theme": indexed["theme"],
+            "identifier": indexed["identifier"],
+            "inSeries": indexed["inSeries"],
             "has_spatial": has_spatial,
             "organization": organization,
-            "distribution_titles": [
-                dist["title"]
-                for dist in (dataset.dcat.get("distribution") or [])
-                if isinstance(dist, dict) and dist.get("title")
-            ],
+            "distribution_titles": indexed["distribution_titles"],
             "popularity": popularity,
             "spatial_shape": dataset.translated_spatial,
             "spatial_centroid": spatial_centroid,

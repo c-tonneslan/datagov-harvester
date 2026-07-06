@@ -154,6 +154,57 @@ def test_normalize_dcat_preserves_publisher_suborganization_object():
     assert normalized["publisher"]["subOrganizationOf"] == {"name": "U.S. Government"}
 
 
+def test_normalize_dcat_text_compatible_dcatus3_objects():
+    dcat = {
+        "identifier": {
+            "@type": "Identifier",
+            "@id": "https://example.gov/identifiers/dataset-1",
+            "notation": "DATASET-1",
+        },
+        "theme": [
+            {
+                "@id": "https://example.gov/concepts/climate-science",
+                "@type": "Concept",
+                "prefLabel": "Climate Science",
+            }
+        ],
+        "landingPage": {
+            "@id": "https://example.gov/datasets/dataset-1",
+            "@type": "Document",
+            "title": "Dataset landing page",
+        },
+        "conformsTo": [
+            {
+                "@id": "https://example.gov/standards/climate-data",
+                "@type": "Standard",
+                "title": "Climate Data Standard",
+            }
+        ],
+        "status": {
+            "@id": "https://example.gov/concepts/status-published",
+            "@type": "Concept",
+            "prefLabel": "Published",
+        },
+        "temporal": [
+            {
+                "@id": "https://example.gov/periods/2024",
+                "@type": "PeriodOfTime",
+                "startDate": "2024-01-01",
+                "endDate": "2024-12-31",
+            }
+        ],
+    }
+
+    normalized = OpenSearchInterface._normalize_dcat_dates(dcat)
+
+    assert normalized["identifier"] == "https://example.gov/identifiers/dataset-1"
+    assert normalized["theme"] == ["Climate Science"]
+    assert normalized["landingPage"] == "https://example.gov/datasets/dataset-1"
+    assert normalized["conformsTo"] == ["https://example.gov/standards/climate-data"]
+    assert normalized["status"] == "Published"
+    assert normalized["temporal"] == ["https://example.gov/periods/2024"]
+
+
 def test_geometry_centroid_returns_average():
     geometry = {"type": "MultiPoint", "coordinates": [[0, 0], [2, 2]]}
 
@@ -208,6 +259,14 @@ def test_dataset_to_document(sample_dataset, monkeypatch):
     assert document["title"] == "Dataset Title"
     assert document["publisher"] == "Publisher"
     assert document["dcat"]["isPartOf"] == "collection-1"
+    # DCAT-US 1.1 isPartOf is mapped up to a DCAT-US 3.0 DatasetSeries list.
+    assert document["inSeries"] == [{"@id": "collection-1"}]
+    # identifier is always stored as a DCAT-US 3.0 Identifier object; the
+    # DCAT-US 1.1 string "id-1" is mapped up to {"@id": "id-1"}.
+    assert document["identifier"] == {"@id": "id-1"}
+    # theme is always stored as a list of DCAT-US 3.0 Concept objects; the
+    # DCAT-US 1.1 string "theme-1" is mapped up to {"prefLabel": "theme-1"}.
+    assert document["theme"] == [{"prefLabel": "theme-1"}]
     assert document["distribution_titles"] == ["CSV download", "API endpoint"]
     assert document["has_spatial"] is True
     assert document["harvest_record"] == "https://catalog.data.gov/harvest_record/hr-1"
@@ -289,6 +348,49 @@ def test_dataset_to_document_has_spatial_theme(sample_dataset, theme):
     assert document["has_spatial"] is True
 
 
+def test_dataset_to_document_normalizes_dcatus3_search_fields(sample_dataset):
+    iface = OpenSearchInterface.__new__(OpenSearchInterface)
+    sample_dataset.dcat["identifier"] = {
+        "@type": "Identifier",
+        "@id": "https://example.gov/identifiers/dataset-1",
+        "notation": "DATASET-1",
+    }
+    sample_dataset.dcat["theme"] = [
+        {
+            "@id": "https://example.gov/concepts/geospatial",
+            "@type": "Concept",
+            "prefLabel": "Geospatial",
+        }
+    ]
+    sample_dataset.dcat.pop("spatial", None)
+    sample_dataset.translated_spatial = None
+
+    document = iface.dataset_to_document(sample_dataset)
+
+    # Top-level searchable fields carry the canonical DCAT-US 3.0 structure.
+    assert document["identifier"] == {
+        "@id": "https://example.gov/identifiers/dataset-1",
+        "notation": "DATASET-1",
+    }
+    assert document["theme"] == [
+        {"@id": "https://example.gov/concepts/geospatial", "prefLabel": "Geospatial"}
+    ]
+    # The free-form `dcat` blob keeps its flattened-to-text representation.
+    assert document["dcat"]["identifier"] == "https://example.gov/identifiers/dataset-1"
+    assert document["dcat"]["theme"] == ["Geospatial"]
+    assert document["has_spatial"] is True
+
+
+def test_dataset_to_document_maps_dcat1_string_theme_to_concept(sample_dataset):
+    iface = OpenSearchInterface.__new__(OpenSearchInterface)
+    sample_dataset.dcat["theme"] = "Geospatial"
+
+    document = iface.dataset_to_document(sample_dataset)
+
+    # A DCAT-US 1.1 bare string theme is mapped up to a DCAT-US 3.0 Concept.
+    assert document["theme"] == [{"prefLabel": "Geospatial"}]
+
+
 @pytest.mark.parametrize(
     "theme",
     [None, [], ["Health"], "Environment", "Spatial"],
@@ -338,6 +440,44 @@ def test_mappings_include_catalog_compatible_fields():
 
     assert mappings["dcat"]["properties"]["isPartOf"] == {"type": "keyword"}
     assert mappings["distribution_titles"]["type"] == "text"
+
+    # identifier is indexed as a DCAT-US 3.0 Identifier object with searchable
+    # sub-fields (both a full-text @id and an exact-match @id.keyword).
+    identifier_mapping = mappings["identifier"]
+    assert identifier_mapping["type"] == "object"
+    id_props = identifier_mapping["properties"]
+    assert id_props["@id"]["type"] == "text"
+    assert id_props["@id"]["fields"]["keyword"] == {"type": "keyword"}
+    assert id_props["notation"] == {"type": "keyword"}
+    assert id_props["schemaAgency"]["type"] == "text"
+    assert id_props["version"] == {"type": "keyword"}
+
+    # theme is indexed as a list of DCAT-US 3.0 Concept objects; prefLabel is
+    # searchable full-text with an exact-match keyword sub-field.
+    theme_mapping = mappings["theme"]
+    assert theme_mapping["type"] == "object"
+    theme_props = theme_mapping["properties"]
+    assert theme_props["prefLabel"]["type"] == "text"
+    # prefLabel.keyword is normalized for case-insensitive faceting, matching
+    # the publisher.normalized / keyword.normalized convention.
+    assert theme_props["prefLabel"]["fields"]["keyword"] == {
+        "type": "keyword",
+        "normalizer": OpenSearchInterface.KEYWORD_NORMALIZER,
+    }
+    assert theme_props["@id"]["type"] == "keyword"
+
+    # inSeries is indexed as a list of DCAT-US 3.0 DatasetSeries objects.
+    in_series_mapping = mappings["inSeries"]
+    assert in_series_mapping["type"] == "object"
+    in_series_props = in_series_mapping["properties"]
+    assert in_series_props["@id"]["type"] == "keyword"
+    assert in_series_props["title"]["type"] == "text"
+    assert in_series_props["title"]["fields"]["keyword"] == {
+        "type": "keyword",
+        "normalizer": OpenSearchInterface.KEYWORD_NORMALIZER,
+    }
+    assert in_series_props["description"]["type"] == "text"
+
     assert mappings["publisher"]["fields"]["raw"] == {"type": "keyword"}
     assert mappings["publisher"]["fields"]["normalized"] == {
         "type": "keyword",
